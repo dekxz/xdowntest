@@ -55,7 +55,7 @@ fun MainScreen(
     vm: MainViewModel,
     onImportCookies: () -> Unit,
     onOpenFolder: () -> Unit,
-    onShareLog: () -> Unit,
+    onPickHistory: () -> Unit,
 ) {
     MaterialTheme(colorScheme = WinDark) {
         val url by vm.url.collectAsState()
@@ -69,6 +69,8 @@ fun MainScreen(
         val busy by vm.busy.collectAsState()
         val downloading by vm.downloading.collectAsState()
         val message by vm.message.collectAsState()
+        val historyLabel by vm.historyLabel.collectAsState()
+        val historyPicked by vm.historyPicked.collectAsState()
 
         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
             Column(
@@ -144,9 +146,17 @@ fun MainScreen(
                     ) { Text(if (downloading) "Cancel" else "Download") }
                     OutlinedButton(onClick = onOpenFolder, modifier = Modifier.weight(1f)) { Text("Open Folder") }
                 }
+                Text(historyLabel, fontSize = 11.sp, color = Color(0xFFA0A0A0), maxLines = 2)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onClick = onShareLog, modifier = Modifier.weight(1f)) { Text("Share history log") }
+                    TextButton(onClick = onPickHistory, enabled = !busy, modifier = Modifier.weight(1f)) {
+                        Text("Pick existing history file", fontSize = 12.sp, maxLines = 2)
+                    }
                     TextButton(onClick = vm::updateYtDlp, enabled = !busy, modifier = Modifier.weight(1f)) { Text("Update yt-dlp") }
+                }
+                if (historyPicked) {
+                    TextButton(onClick = vm::useDefaultHistory, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                        Text("Use the app's own history file instead", fontSize = 12.sp)
+                    }
                 }
             }
         }

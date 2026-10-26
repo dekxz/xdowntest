@@ -44,6 +44,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val busy = MutableStateFlow(false)
     val downloading = MutableStateFlow(false)
     val message = MutableStateFlow<Msg?>(null)
+    val historyLabel = MutableStateFlow(history.label())
+    val historyPicked = MutableStateFlow(history.isPicked())
 
     private var job: Job? = null
     @Volatile private var cancelled = false
@@ -63,6 +65,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun setUrl(s: String) { url.value = s }
     fun setFormat(f: Fmt) { format.value = f }
     fun setUseCookies(b: Boolean) { useCookies.value = b }
+
+    // ---- history file ----
+    private fun refreshHistoryInfo() {
+        historyLabel.value = history.label()
+        historyPicked.value = history.isPicked()
+    }
+
+    /** "Pick existing history file": use a file chosen with the system file picker. */
+    fun useHistoryFile(uri: Uri) {
+        if (busy.value) { show("Please wait", "Finish or cancel the current operation first."); return }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { history.usePickedFile(uri) }
+            refreshHistoryInfo()
+            show(if (result.ok) "History file" else "Could not use that file", result.message)
+        }
+    }
+
+    fun useDefaultHistory() {
+        if (busy.value) { show("Please wait", "Finish or cancel the current operation first."); return }
+        history.useDefault()
+        refreshHistoryInfo()
+        show("History file", "Using the app's own ${DownloadHistory.NAME} in Downloads/${MediaExporter.FOLDER} again.")
+    }
 
     fun importCookies(uri: Uri) {
         try {

@@ -2,9 +2,11 @@ package com.xdownloader.app
 
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 
 /**
  * xdownloader_history.log: ONE file in Downloads/XDownloader, updated after every download.
@@ -14,6 +16,10 @@ import android.provider.MediaStore
  * lookup matches any file whose name starts with the log's name instead of one exact name.
  * Any extra copies created by older versions are merged into the first one and removed.
  *
+ * "Pick existing history file": because Android only lets an app touch files it created, the user can
+ * choose any existing .log file with the system file picker. The app keeps the (persistable) permission,
+ * and from then on reads and updates that exact file instead of the default one.
+ *
  * Note: Android only lets an app read files it created itself. After an uninstall, a fresh install
  * can't read the old log and starts a new one.
  */
@@ -22,12 +28,27 @@ class DownloadHistory(private val context: Context) {
     companion object {
         const val NAME = "xdownloader_history.log"
         private const val PREFIX = "xdownloader_history"
+        private const val PREF_PICKED = "picked_uri"
     }
 
     private val resolver get() = context.contentResolver
+    private val prefs = context.getSharedPreferences("xdownloader_history", Context.MODE_PRIVATE)
 
-    /** All history files in our folder, oldest first. */
-    private fun allLogs(): List<Uri> {
+    /** The history file the user picked with the file picker, if it is still reachable. */
+    private fun picked(): Uri? {
+        val uri = prefs.getString(PREF_PICKED, null)?.let { Uri.parse(it) } ?: return null
+        return try {
+            if (resolver.openInputStream(uri)?.use { true } == true) uri else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** The picked file if there is one, otherwise the app's own log(s). */
+    private fun allLogs(): List<Uri> = picked()?.let { listOf(it) } ?: defaultLogs()
+
+    /** All history files the app created in our folder, oldest first. */
+    private fun defaultLogs(): List<Uri> {
         val result = mutableListOf<Uri>()
         resolver.query(
             MediaStore.Downloads.EXTERNAL_CONTENT_URI,
@@ -52,6 +73,14 @@ class DownloadHistory(private val context: Context) {
             ""
         }
 
+    /** Like [readText] but returns null when the file could not be read (so we never overwrite blindly). */
+    private fun readTextOrNull(uri: Uri): String? =
+        try {
+            resolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+        } catch (e: Exception) {
+            null
+        }
+
     @Synchronized
     fun contains(url: String, identifier: String): Boolean {
         val entry = "$url|$identifier"
@@ -60,7 +89,13 @@ class DownloadHistory(private val context: Context) {
 
     @Synchronized
     fun append(url: String, identifier: String) {
-        val logs = allLogs()
+        val pickedFile = picked()
+        if (pickedFile != null) {
+            appendToPicked(pickedFile, "$url|$identifier")
+            return
+        }
+
+        val logs = defaultLogs()
         val primary = logs.firstOrNull()
 
         if (primary == null) {
@@ -96,5 +131,117 @@ class DownloadHistory(private val context: Context) {
                 try { resolver.delete(extra, null, null) } catch (_: Exception) {}
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Pick existing history file
+    // ---------------------------------------------------------------------------------------
+
+    data class PickResult(val ok: Boolean, val message: String)
+
+    /** True when a user-picked file is in use. */
+    fun isPicked(): Boolean = picked() != null
+
+    private fun displayName(uri: Uri): String? =
+        try {
+            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+
+    /** Short description of which log is in use, for the UI. */
+    fun label(): String =
+        picked()?.let { "History file: ${displayName(it) ?: "selected file"}" }
+            ?: "History file: ${NAME} (default, Downloads/${MediaExporter.FOLDER})"
+
+    /** Appends one line to a picked file. Existing content is never rewritten unless appending is unsupported. */
+    private fun appendToPicked(pickedFile: Uri, entry: String) {
+        val text = readTextOrNull(pickedFile) ?: return // can't read it -> don't risk damaging it
+        if (text.lines().any { it.trim() == entry }) return
+        val lead = if (text.isNotEmpty() && !text.endsWith("\n")) "\n" else ""
+        val bytes = (lead + entry + "\n").toByteArray(Charsets.UTF_8)
+        try {
+            // append mode leaves everything already in the file untouched
+            if (resolver.openOutputStream(pickedFile, "wa")?.use { it.write(bytes) } != null) return
+        } catch (_: Exception) {}
+        // Provider without append support: rewrite the whole file (we already hold its full text).
+        try {
+            resolver.openOutputStream(pickedFile, "wt")?.use { it.write((text + lead + entry + "\n").toByteArray(Charsets.UTF_8)) }
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Starts using [uri] (chosen with ACTION_OPEN_DOCUMENT) as the history file.
+     * Keeps the access permission across restarts and copies over any entries of the app's own log
+     * that the picked file does not have yet, so nothing is lost.
+     */
+    @Synchronized
+    fun usePickedFile(uri: Uri): PickResult {
+        // keep access after the app is closed / the phone is restarted
+        try {
+            resolver.takePersistableUriPermission(
+                uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        } catch (e: Exception) {
+            return PickResult(false, "Android did not allow read and write access to that file.\nPlease choose a file from a location that allows editing (e.g. Downloads).")
+        }
+
+        val text = readTextOrNull(uri)
+            ?: return PickResult(false, "That file could not be read.")
+        try {
+            // open for appending without writing anything: proves we can modify it
+            resolver.openOutputStream(uri, "wa")?.use { } ?: return PickResult(false, "That file could not be opened for writing.")
+        } catch (e: Exception) {
+            return PickResult(false, "That file could not be opened for writing.")
+        }
+
+        // bring over entries from the app's own log (if any) that the picked file lacks
+        val existing = text.lines().map { it.trim() }.filter { it.isNotEmpty() }.toHashSet()
+        val missing = LinkedHashSet<String>()
+        for (log in defaultLogs()) {
+            readText(log).lines().map { it.trim() }.filter { it.isNotEmpty() && it !in existing }.forEach { missing += it }
+        }
+        var merged = 0
+        if (missing.isNotEmpty()) {
+            val lead = if (text.isNotEmpty() && !text.endsWith("\n")) "\n" else ""
+            val bytes = (lead + missing.joinToString("\n") + "\n").toByteArray(Charsets.UTF_8)
+            val ok = try {
+                resolver.openOutputStream(uri, "wa")?.use { it.write(bytes) } != null
+            } catch (_: Exception) { false }
+            if (ok) merged = missing.size
+        }
+
+        // release the permission of a previously picked file
+        prefs.getString(PREF_PICKED, null)?.let { Uri.parse(it) }?.takeIf { it != uri }?.let { old ->
+            try {
+                resolver.releasePersistableUriPermission(
+                    old, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+        }
+        prefs.edit().putString(PREF_PICKED, uri.toString()).apply()
+
+        val name = displayName(uri) ?: "the selected file"
+        val entries = existing.size + merged
+        return PickResult(
+            true,
+            "Now using \"$name\" as the history log ($entries entries).\n" +
+                if (merged > 0) "$merged entries from the app's previous log were added to it." else "Downloads will be checked against it and added to it."
+        )
+    }
+
+    /** Goes back to the app's own log in Downloads/XDownloader. The picked file is left as it is. */
+    @Synchronized
+    fun useDefault() {
+        prefs.getString(PREF_PICKED, null)?.let { Uri.parse(it) }?.let { old ->
+            try {
+                resolver.releasePersistableUriPermission(
+                    old, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+        }
+        prefs.edit().remove(PREF_PICKED).apply()
     }
 }

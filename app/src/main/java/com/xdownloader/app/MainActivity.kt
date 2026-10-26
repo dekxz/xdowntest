@@ -26,11 +26,14 @@ class MainActivity : ComponentActivity() {
             val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                 uri?.let { vm.importCookies(it) }
             }
+            val historyPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                uri?.let { vm.useHistoryFile(it) }
+            }
             MainScreen(
                 vm = vm,
                 onImportCookies = { picker.launch(arrayOf("text/plain", "application/octet-stream", "*/*")) },
                 onOpenFolder = ::openDownloads,
-                onShareLog = ::shareLog,
+                onPickHistory = { historyPicker.launch(arrayOf("*/*")) },
             )
         }
     }
@@ -68,19 +71,5 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             vm.message.value = MainViewModel.Msg("Error", "Could not open folder: ${e.message}\nFiles are in Downloads/${MediaExporter.FOLDER}.")
         }
-    }
-
-    private fun shareLog() {
-        val uri = vm.history.uri()
-        if (uri == null) {
-            vm.message.value = MainViewModel.Msg("History log", "No downloads have been logged yet.\nThe log is saved as ${DownloadHistory.NAME} in Downloads/${MediaExporter.FOLDER}.")
-            return
-        }
-        val send = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        startActivity(Intent.createChooser(send, DownloadHistory.NAME))
     }
 }
